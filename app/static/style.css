@@ -225,6 +225,46 @@ body {
 .btn-mini:hover { background: #f1f5f9; }
 .saved-tip { font-size: 12px; color: var(--ok); }
 
+/* ---------- TLS 1.2 session demo ---------- */
+.tls-card { margin-top: 18px; border-color: #bfdbfe; }
+.tls-card h2 { display: flex; align-items: center; gap: 8px; }
+.tls-hint code { font-family: var(--mono); background: #f1f5f9; padding: 1px 6px; border-radius: 5px; }
+.session-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 14px 0; }
+.session-box {
+  border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px;
+  background: #f8fafc; display: flex; flex-direction: column; gap: 10px;
+}
+.session-box.has-session { border-color: #86efac; background: #f0fdf4; }
+.session-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.session-state { font-size: 13px; font-weight: 700; font-family: var(--mono); }
+.session-empty { color: var(--ink-faint); font-weight: 500; }
+.session-resumed { color: var(--ok); }
+.session-full { color: var(--brand); }
+.session-meta { list-style: none; margin: 0; padding: 0; font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
+.session-meta li { display: flex; justify-content: space-between; gap: 10px; color: var(--ink-soft); }
+.session-meta li code { font-family: var(--mono); color: var(--ink); word-break: break-all; text-align: right; }
+.session-meta li.empty { color: var(--ink-faint); justify-content: flex-start; }
+.btn-forget { align-self: flex-start; }
+.reject-group { margin-bottom: 14px; }
+.reject-group .mode-opt { font-size: 13px; }
+.tls-scenarios { margin-top: 6px; }
+.scenario-busy { opacity: .65; pointer-events: none; }
+.tls-demo-log {
+  margin-top: 14px; max-height: 240px; overflow-y: auto;
+  background: #0b1220; border-radius: 10px; padding: 12px 14px;
+  font-family: var(--mono); font-size: 12px; color: #cbd5e1;
+}
+.demo-log-line { padding: 3px 0; border-bottom: 1px solid #1e293b; }
+.demo-log-line.log-resumed { color: #86efac; }
+.demo-log-line.log-full { color: #93c5fd; }
+.demo-log-line.log-err { color: #fca5a5; }
+
+.pill-resumed { background: var(--ok-bg); color: #166534; }
+.pill-full { background: #dbeafe; color: #1e40af; }
+.tls-ver { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
+.hs-resumed { color: var(--ok) !important; }
+.hs-full { color: var(--brand) !important; }
+
 /* ---------- history ---------- */
 .history-card { margin-top: 18px; }
 .table-wrap { overflow-x: auto; }

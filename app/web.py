@@ -46,18 +46,25 @@ def create_app(
     else:
         app.extensions["device_port"] = int(os.environ.get("DEVICE_PORT", "8443"))
 
+    def apply_device_tls() -> None:
+        handle: DualStackDevice | None = app.extensions.get("device_handle")
+        if handle is not None:
+            handle.apply_tls_settings()
+
     @app.get("/healthz")
     def healthz() -> Any:
         return jsonify({"ok": True})
 
     @app.get("/")
     def index() -> str:
+        st: DeviceState = app.extensions["device_state"]
         return render_template(
             "index.html",
             device_name=device_name,
             device_port=app.extensions["device_port"],
             parallel_delay_ms=int(race_client.PARALLEL_DELAY * 1000),
             deadline_ms=int(race_client.DEADLINE * 1000),
+            tls12_demo=st.tls12_demo_enabled(),
         )
 
     @app.get("/api/state")
@@ -69,10 +76,18 @@ def create_app(
     def api_settings() -> Any:
         st: DeviceState = app.extensions["device_state"]
         patch = request.get_json(silent=True) or {}
+        demo_was_on = st.tls12_demo_enabled()
         try:
             settings = st.update_settings(patch)
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
+        # 演示被关闭：回到默认协商，清空 TLS 1.2 会话缓存（context 也会重建，
+        # 旧条目本就无法取用，这里让观测状态同步回到干净起点）
+        if demo_was_on and not st.tls12_demo_enabled():
+            st.sessions.forget("ipv4")
+            st.sessions.forget("ipv6")
+        # 协议版本/拒绝恢复相关开关变化后，热重建受影响栈的服务端 TLS context
+        apply_device_tls()
         return jsonify({"ok": True, "settings": settings, "state": st.snapshot()})
 
     @app.post("/api/reset-count")
@@ -81,10 +96,26 @@ def create_app(
         st.reset_count()
         return jsonify({"ok": True, "state": st.snapshot()})
 
+    @app.post("/api/session/forget")
+    def api_session_forget() -> Any:
+        """值班员让样例设备忘掉指定入口（ipv4/ipv6，或 both）的 TLS 会话。"""
+        st: DeviceState = app.extensions["device_state"]
+        body = request.get_json(silent=True) or {}
+        stack = str(body.get("stack", "")).lower()
+        targets = ("ipv4", "ipv6") if stack in ("both", "all", "") else (stack,)
+        unknown = [s for s in targets if s not in ("ipv4", "ipv6")]
+        if unknown:
+            return jsonify({"ok": False, "error": f"invalid stack: {unknown[0]!r}"}), 400
+        removed = {}
+        for s in targets:
+            removed[s] = st.sessions.forget(s)
+        return jsonify({"ok": True, "removed": removed, "state": st.snapshot()})
+
     @app.post("/api/reload")
     def api_reload() -> Any:
         body = request.get_json(silent=True) or {}
         request_id = body.get("request_id")
+        st: DeviceState = app.extensions["device_state"]
         race = race_client.ReloadRace(
             port=int(app.extensions["device_port"]),
             ca_cert=app.extensions["ca_cert"],
@@ -94,9 +125,10 @@ def create_app(
             ),
             deadline=float(body.get("deadline_s", race_client.DEADLINE)),
             request_id=str(request_id) if request_id else None,
+            tls12_demo=st.tls12_demo_enabled(),
+            session_store=st.sessions,
         )
         result = race.run()
-        st: DeviceState = app.extensions["device_state"]
         return jsonify({"result": result.to_dict(), "device": st.snapshot()})
 
     return app

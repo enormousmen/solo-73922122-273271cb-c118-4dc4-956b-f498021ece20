@@ -1,6 +1,6 @@
-"""双栈竞速重载客户端。
+"""双栈竞速重载客户端（含 TLS 1.2 会话恢复演示）。
 
-规则（与值班台需求一一对应）：
+竞速规则（与值班台需求一一对应）：
 
 1. 先连 IPv6（目标字面地址 ``::1``），TLS 证书校验使用同一个 ``device_name``。
 2. IPv6 在 ``parallel_delay``（默认 0.25s）内没有通过证书校验，就并行启动 IPv4。
@@ -11,6 +11,17 @@
 6. 整次操作上限 ``deadline``（默认 3.0s）。
 7. 截止时 POST 尚未开始发送 -> ``not_sent``（未下发）。
 8. POST 已开始发送但没拿到完整回执 -> ``unknown``（结果未知），绝不换路重发。
+
+TLS 1.2 会话恢复演示（``tls12_demo`` 开启时生效；关闭时行为与历史版本完全一致，
+协议默认协商照旧、不接触会话缓存）：
+
+9. 每次尝试都新建 TCP 连接；IPv4/IPv6 各在 :class:`~app.session_store.SessionStore`
+   中保留至多一份经现有 CA + 设备名完整校验后保存的会话，证书到期后停用。
+10. 发起握手前按栈领取单调世代号；携带缓存会话发起恢复时，若服务端未接受
+    （拒绝恢复开关/票据失效/会话缓存不匹配），OpenSSL 会在**同一连接**上
+    退化为完整握手，校验通过才允许继续并保存新会话。
+11. 缓存操作全部在短临界区内完成（仅字典读写），并发握手绝不排队等缓存；
+    较早发起的握手即使晚完成，也不能覆盖/清掉较新握手已保存的会话。
 
 实现采用“每路一个工作线程 + 协调线程（调用 run 的线程）”，
 winner 判定与“是否已开始发送”都在同一把锁下与截止时刻做原子协调。
@@ -29,9 +40,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-IPV6 = "ipv6"
-IPV4 = "ipv4"
-STACKS = (IPV6, IPV4)
+from .session_store import HS_FULL, HS_RESUMED, IPV4, IPV6, STACKS, SessionStore
+
 OTHER = {IPV6: IPV4, IPV4: IPV6}
 
 HOSTS = {
@@ -72,6 +82,9 @@ class RaceResult:
     deadline_s: float = DEADLINE
     timeline: list[dict[str, Any]] = field(default_factory=list)
     attempts: dict[str, Any] = field(default_factory=dict)
+    # winner 实际采用的握手方式：full（完整握手）/ resumed（会话恢复）/ None
+    winner_handshake_kind: str | None = None
+    tls12_demo: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -88,14 +101,20 @@ class RaceResult:
             "deadline_ms": int(self.deadline_s * 1000),
             "timeline": self.timeline,
             "attempts": self.attempts,
+            "winner_handshake_kind": self.winner_handshake_kind,
+            "tls12_demo": self.tls12_demo,
         }
 
 
-def build_client_context(ca_cert: str | Path) -> ssl.SSLContext:
+def build_client_context(ca_cert: str | Path, tls12_only: bool = False) -> ssl.SSLContext:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = True          # 按 device_name 校验
     ctx.verify_mode = ssl.CERT_REQUIRED
     ctx.load_verify_locations(cafile=str(ca_cert))
+    if tls12_only:
+        # 仅在演示开关打开期限定 TLS 1.2；默认不传时协议协商照旧
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_2
     return ctx
 
 
@@ -113,6 +132,8 @@ class ReloadRace:
         deadline: float = DEADLINE,
         request_id: str | None = None,
         payload: dict[str, Any] | None = None,
+        tls12_demo: bool = False,
+        session_store: SessionStore | None = None,
     ) -> None:
         self.port = port
         self.ca_cert = Path(ca_cert)
@@ -122,6 +143,10 @@ class ReloadRace:
         self.deadline = deadline
         self.request_id = request_id or f"req-{uuid.uuid4().hex[:12]}"
         self.payload = payload or {}
+
+        # TLS 1.2 会话恢复演示；关闭时全程不读取/写入共享缓存
+        self.tls12_demo = bool(tls12_demo)
+        self.session_store = session_store if self.tls12_demo else None
 
         self._t0 = time.monotonic()
         self._deadline_mono = self._t0 + deadline
@@ -146,7 +171,14 @@ class ReloadRace:
         self._post_error: str | None = None
         self._post_started_mono: float | None = None
 
-        self._ctx = build_client_context(self.ca_cert)
+        # 演示模式：复用 SessionStore 持有的共享 SSLContext
+        # （SSLSession 与 context 绑定，且共享 context 支持并发握手）
+        if self.tls12_demo and self.session_store is not None:
+            self._ctx = self.session_store.client_context(
+                self.ca_cert, tls12_only=True
+            )
+        else:
+            self._ctx = build_client_context(self.ca_cert, tls12_only=False)
         self._threads: list[threading.Thread] = []
 
     # ---------- 工具 ----------
@@ -221,6 +253,7 @@ class ReloadRace:
                 "targets": {s: f"https://{HOSTS[s]}:{self.port}" for s in STACKS},
                 "parallel_delay_ms": int(self.parallel_delay * 1000),
                 "deadline_ms": int(self.deadline * 1000),
+                "tls12_demo": self.tls12_demo,
             },
         )
 
@@ -288,6 +321,10 @@ class ReloadRace:
         host = HOSTS[stack]
         family = socket.AF_INET6 if stack == IPV6 else socket.AF_INET
         raw: socket.socket | None = None
+        # 世代号在任何 I/O 之前领取：先发起的握手世代号一定更小，
+        # 之后无论何时完成都无法覆盖更晚握手保存的会话。
+        generation = self.session_store.begin(stack) if self.session_store else 0
+        resumption_attempted = False
         try:
             with self._lock:
                 if self._canceled:
@@ -303,18 +340,34 @@ class ReloadRace:
             else:
                 connect_addr = (host, self.port)
             t_connect = time.monotonic()
-            raw.connect(connect_addr)
+            raw.connect(connect_addr)  # 每次尝试都是全新 TCP 连接
             self._emit(
                 "tcp_connected",
                 stack,
                 connect_ms=int((time.monotonic() - t_connect) * 1000),
             )
 
+            # 演示模式：尝试取本栈缓存的会话（证书/会话到期、context 重建由 SessionStore 拦截）
+            cached_session = None
+            if self.session_store is not None:
+                cached_session = self.session_store.take(
+                    stack, context_id=id(self._ctx)
+                )
+                resumption_attempted = cached_session is not None
+                if resumption_attempted:
+                    self._emit("session_resume_attempted", stack, generation=generation)
+
             # wrap_socket(do_handshake_on_connect 默认 True)：
             # 返回成功即代表 TLS 握手 + 证书校验（含 hostname）通过。
+            # 携带 session 时若服务端拒绝恢复，OpenSSL 在同一连接上自动退化为完整握手。
             raw.settimeout(max(0.02, self._remaining()))
             t_hs = time.monotonic()
-            tls_sock = self._ctx.wrap_socket(raw, server_hostname=self.device_name)
+            if cached_session is not None:
+                tls_sock = self._ctx.wrap_socket(
+                    raw, server_hostname=self.device_name, session=cached_session
+                )
+            else:
+                tls_sock = self._ctx.wrap_socket(raw, server_hostname=self.device_name)
             raw = None  # 所有权已移交 TLS socket
             hs_ms = int((time.monotonic() - t_hs) * 1000)
 
@@ -328,10 +381,45 @@ class ReloadRace:
                 should_close.close()
                 return
 
+            # 实际握手方式：以 OpenSSL 报告的 session_reused 为准；
+            # 演示关闭时不暴露该字段，行为与历史版本完全一致。
+            session_reused = bool(tls_sock.session_reused)
+            handshake_kind = HS_RESUMED if session_reused else HS_FULL
+            if self.tls12_demo:
+                if session_reused:
+                    self._emit(
+                        "session_resumed",
+                        stack,
+                        generation=generation,
+                        handshake_ms=hs_ms,
+                    )
+                elif resumption_attempted:
+                    # 携带了缓存会话但服务端没有接受（拒绝恢复开关、票据失效、
+                    # 服务端会话缓存不匹配等）：同一连接已按原规则完成完整握手且校验通过
+                    self._emit(
+                        "session_resume_declined_full_handshake",
+                        stack,
+                        generation=generation,
+                        handshake_ms=hs_ms,
+                    )
+                else:
+                    self._emit(
+                        "full_handshake",
+                        stack,
+                        generation=generation,
+                        handshake_ms=hs_ms,
+                    )
+
             cert = tls_sock.getpeercert() or {}
             subject = dict(x[0] for x in cert.get("subject", ()))
             san = cert.get("subjectAltName", ())
-            self._cert_info[stack] = {
+            cert_not_after_epoch: float | None = None
+            if "notAfter" in cert:
+                try:
+                    cert_not_after_epoch = float(ssl.cert_time_to_seconds(cert["notAfter"]))
+                except Exception:
+                    cert_not_after_epoch = None
+            info: dict[str, Any] = {
                 "subject_cn": subject.get("commonName"),
                 "subject_alt_name": [f"{k}:{v}" for k, v in san],
                 "cipher": (tls_sock.cipher() or [None])[0],
@@ -339,13 +427,57 @@ class ReloadRace:
                 "handshake_ms": hs_ms,
                 "verified_against_name": self.device_name,
             }
-            self._emit("cert_verified", stack, handshake_ms=hs_ms, cn=subject.get("commonName"))
+            if self.tls12_demo:
+                info.update(
+                    handshake_kind=handshake_kind,
+                    session_reused=session_reused,
+                    generation=generation,
+                )
+            if cert_not_after_epoch is not None:
+                info["cert_not_after_epoch"] = cert_not_after_epoch
+            self._cert_info[stack] = info
+            if self.tls12_demo:
+                self._emit(
+                    "cert_verified",
+                    stack,
+                    handshake_ms=hs_ms,
+                    cn=subject.get("commonName"),
+                    handshake_kind=handshake_kind,
+                )
+            else:
+                self._emit(
+                    "cert_verified",
+                    stack,
+                    handshake_ms=hs_ms,
+                    cn=subject.get("commonName"),
+                )
+
+            # 校验通过后立即保存/刷新本栈会话（在 winner 判定之前，
+            # 落败路径的会话同样保留，供下一次同栈重载恢复）。
+            # 世代守卫保证旧握手不会覆盖新握手保存的会话。
+            saved = False
+            save_skipped_reason: str | None = None
+            if self.session_store is not None and cert_not_after_epoch is not None:
+                saved = self.session_store.save(
+                    stack,
+                    ssl_session=tls_sock.session,
+                    handshake_kind=handshake_kind,
+                    tls_version=tls_sock.version() or "",
+                    cipher=(tls_sock.cipher() or [None, None, None])[0] or "",
+                    generation=generation,
+                    cert_not_after=cert_not_after_epoch,
+                    context_id=id(self._ctx),
+                )
+                if not saved:
+                    save_skipped_reason = "stale_generation"
+                    self._emit("session_save_skipped_stale_generation", stack, generation=generation)
             self._cert_passed[stack].set()
             self._settled[stack].set()
 
             if not self._claim_winner(stack):
                 # 另一路已经先通过：本连接立即释放，绝不发送
-                self._emit("loser_released", stack)
+                self._emit("loser_released", stack, session_saved=saved,
+                           save_skipped=save_skipped_reason)
                 try:
                     tls_sock.close()
                 except OSError:
@@ -359,16 +491,26 @@ class ReloadRace:
             with self._lock:
                 winner_is_this = self._winner == stack
                 post_started = self._post_started
+                canceled = self._canceled
             if winner_is_this and post_started:
                 # 发送开始后的任何失败都归类为“结果未知”，且不重发
                 self._post_error = self._post_error or err
                 self._emit("post_connection_error", stack, error=err)
                 self._post_done.set()
+            elif canceled:
+                # 协调方已取消本路（winner 选出后释放另一路、或截止关闭 socket）：
+                # 这不是对端证书/协议问题，绝不能因此作废已缓存的会话。
+                self._emit("attempt_canceled", stack, error=err)
             else:
                 self._attempt_errors[stack] = err
                 self._failed[stack].set()
                 self._settled[stack].set()
                 self._emit("attempt_failed", stack, error=err)
+                # 仅 TLS 层失败（如证书过期/校验失败、协议告警）才作废本世代及更旧的
+                # 会话；TCP 层的 stall 超时/RST 不代表会话失效，保留缓存。
+                # 世代守卫保证不会清掉更晚发起的握手已保存的新会话。
+                if self.session_store is not None and isinstance(exc, ssl.SSLError):
+                    self.session_store.invalidate(stack, generation)
         finally:
             # 若 winner 已进入/完成自己的收发，socket 由 _send_and_receive 关闭；
             # 这里的 pop-close 是幂等兜底。
@@ -466,13 +608,21 @@ class ReloadRace:
         elapsed_ms = int((time.monotonic() - self._t0) * 1000)
         attempts: dict[str, Any] = {}
         for s in STACKS:
+            cert = self._cert_info.get(s)
             attempts[s] = {
                 "host": HOSTS[s],
                 "error": self._attempt_errors.get(s),
-                "cert": self._cert_info.get(s),
+                "cert": cert,
                 "cert_passed": self._cert_passed[s].is_set(),
                 "failed": self._failed[s].is_set(),
+                "handshake_kind": cert.get("handshake_kind") if cert else None,
+                "tls_version": cert.get("version") if cert else None,
+                "session_reused": cert.get("session_reused") if cert else None,
             }
+
+        winner_handshake_kind = None
+        if winner is not None:
+            winner_handshake_kind = attempts[winner].get("handshake_kind")
 
         self._emit("finalized", detail={"status": status, "post_started": post_started})
 
@@ -490,6 +640,8 @@ class ReloadRace:
             deadline_s=self.deadline,
             timeline=list(self._timeline),
             attempts=attempts,
+            winner_handshake_kind=winner_handshake_kind,
+            tls12_demo=self.tls12_demo,
         )
 
 
@@ -500,6 +652,8 @@ def run_reload(
     device_name: str = "switch-demo.local",
     parallel_delay: float = PARALLEL_DELAY,
     deadline: float = DEADLINE,
+    tls12_demo: bool = False,
+    session_store: SessionStore | None = None,
 ) -> RaceResult:
     return ReloadRace(
         port=port,
@@ -507,4 +661,6 @@ def run_reload(
         device_name=device_name,
         parallel_delay=parallel_delay,
         deadline=deadline,
+        tls12_demo=tls12_demo,
+        session_store=session_store,
     ).run()

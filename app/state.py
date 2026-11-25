@@ -1,6 +1,8 @@
 """共享的样例设备状态。
 
 IPv4 / IPv6 两个监听栈共用同一个 DeviceState，因此重载计数是“两路共用”的。
+TLS 1.2 会话恢复演示的会话缓存（:class:`~app.session_store.SessionStore`）也挂在这里，
+值班台与竞速客户端共享同一份按栈隔离的缓存。
 """
 from __future__ import annotations
 
@@ -8,6 +10,8 @@ import threading
 import time
 from collections import deque
 from typing import Any
+
+from .session_store import SessionStore
 
 MODE_OK = "ok"
 MODE_STALL = "stall"   # 接受 TCP 后卡住 TLS 握手
@@ -35,12 +39,28 @@ class DeviceState:
             "ipv6_mode": MODE_OK,
             "ipv4_mode": MODE_OK,
             "disconnect_after_execute": False,
+            # TLS 1.2 会话恢复演示开关：
+            # 关闭（默认）时 TLS 协议协商与缓存行为完全照旧；
+            # 开启后客户端/服务端都限定 TLS 1.2，并启用按栈的会话缓存。
+            "tls12_demo": False,
+            # 服务端按栈拒绝会话恢复（OP_NO_TICKET + 重建 context 清空服务端缓存）
+            "ipv6_reject_resume": False,
+            "ipv4_reject_resume": False,
         }
         self._history: deque[dict[str, Any]] = deque(maxlen=30)
+        self.sessions = SessionStore()
 
     def get_mode(self, stack: str) -> str:
         with self._lock:
             return self.settings.get(f"{stack}_mode", MODE_OK)
+
+    def rejects_resume(self, stack: str) -> bool:
+        with self._lock:
+            return bool(self.settings.get(f"{stack}_reject_resume", False))
+
+    def tls12_demo_enabled(self) -> bool:
+        with self._lock:
+            return bool(self.settings.get("tls12_demo", False))
 
     def update_settings(self, patch: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
@@ -58,9 +78,21 @@ class DeviceState:
                 self.settings["disconnect_after_execute"] = bool(
                     patch["disconnect_after_execute"]
                 )
+            if "tls12_demo" in patch:
+                self.settings["tls12_demo"] = bool(patch["tls12_demo"])
+            if "ipv6_reject_resume" in patch:
+                self.settings["ipv6_reject_resume"] = bool(patch["ipv6_reject_resume"])
+            if "ipv4_reject_resume" in patch:
+                self.settings["ipv4_reject_resume"] = bool(patch["ipv4_reject_resume"])
             return dict(self.settings)
 
-    def register_reload(self, stack: str, request_id: str, peer: str = "") -> dict[str, Any]:
+    def register_reload(
+        self,
+        stack: str,
+        request_id: str,
+        peer: str = "",
+        tls_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """设备真正执行一次重载时调用；两个栈共用同一计数。"""
         with self._lock:
             self.reload_count += 1
@@ -73,6 +105,10 @@ class DeviceState:
                 "request_id": request_id,
                 "peer": peer,
                 "disconnect": bool(self.settings["disconnect_after_execute"]),
+                # 服务端视角的实际握手方式（TLS 1.2 演示开启时有值）
+                "handshake_kind": (tls_info or {}).get("handshake_kind"),
+                "tls_version": (tls_info or {}).get("tls_version"),
+                "session_reused": (tls_info or {}).get("session_reused"),
             }
             self._history.append(entry)
             return {
@@ -97,4 +133,5 @@ class DeviceState:
                 "mode_labels": dict(MODE_LABELS),
                 "uptime_s": round(time.time() - self.started_at, 1),
                 "history": list(reversed(self._history)),
+                "sessions": self.sessions.snapshot(),
             }
